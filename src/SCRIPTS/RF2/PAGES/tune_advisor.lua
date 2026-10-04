@@ -33,7 +33,7 @@ local FF_MIN_CORR = 0.85
 local FF_HOT = 1.15
 local FF_LOW = 0.85
 local FF_STEP_MAX = 0.2             -- change FF by at most 20% per step
-local F_MAX = 1000
+local GAIN_MAX = 1000               -- firmware PID_GAIN_MAX, the limit for P and FF alike
 local RATE_RAW_MAX = 255
 -- Collective fact
 local BAND_MIN_COUNT = 300
@@ -84,13 +84,22 @@ local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
 local function ffJudged(a) return a.ffCount >= FF_MIN_COUNT and a.ffCorr >= FF_MIN_CORR end
 local function ffOff(a) return ffJudged(a) and (a.ffGain > FF_HOT or a.ffGain < FF_LOW) end
 
--- Max rate asked at full stick (deg/s), where the rates type makes it direct
+-- Max rate asked at full stick (deg/s), where the rates type makes it direct: the
+-- firmware's rate curves (fc/rc_rates.c) at full stick. Actual and Quick reach the
+-- larger of their two terms.
 local function maxRateAsked(a)
-    local info = rateInfo(a.ratesType)
-    if not info then return nil end
-    if info.name == "ACTUAL" or info.name == "QUICK" then return round(a.sRate / info.s.scale) end
-    if info.name == "ROTORFL" then return round(a.rcRate / info.rc.scale) end
+    local name = RATE_FILES[a.ratesType]
+    if name == "ACTUAL" then return math.max(a.rcRate, a.sRate) * 10 end
+    if name == "QUICK" then return math.max(a.sRate * 10, a.rcRate * 2) end
+    if name == "ROTORFL" then return a.rcRate * 5 end
     return nil
+end
+
+-- How many lines rateActions() adds for this rates_type
+local function rateActionCount(a)
+    local info = rateInfo(a.ratesType)
+    local cols = info and LINEAR[info.name]
+    return cols and #cols or 1
 end
 
 -- Suggests scaling the rate curve by k (e.g. 1.25 = 25% faster everywhere)
@@ -109,10 +118,15 @@ local function rateActions(a, name, k, act)
     end
 end
 
--- Returns response, stops, actions, whys for one axis (0 roll, 1 pitch, 2 yaw)
+-- Returns response, stops, actions, whys for one axis (0 roll, 1 pitch, 2 yaw).
+-- A change and its reason go in together or not at all, so a reason never shows for a
+-- change that was left out: a later change first checks room(). The first change
+-- (fly more, FF with its rates, or full-stick rates) always fits. The reasons for changes
+-- stay within three; only the closing collective fact can be cut.
 local function advise(a, axis)
     local name = axisNames[axis]
     local actions, whys = {}, {}
+    local function room(n) return #actions + n <= 3 end
     local function act(s) if #actions < 3 then actions[#actions + 1] = s end end
     local function why(s) if #whys < 3 then whys[#whys + 1] = s end end
 
@@ -131,7 +145,7 @@ local function advise(a, axis)
         local hot = g > FF_HOT
         response = string.format(hot and "%d%% faster than asked" or "%d%% slower than asked", round(math.abs(g - 1) * 100))
         if a.F > 0 then
-            local newF = clamp(round(a.F * clamp(1 / g, 1 - FF_STEP_MAX, 1 + FF_STEP_MAX)), 1, F_MAX)
+            local newF = clamp(round(a.F * clamp(1 / g, 1 - FF_STEP_MAX, 1 + FF_STEP_MAX)), 1, GAIN_MAX)
             act(string.format("PID Gains > %s > FF: %d -> %d", name, a.F, newF))
             -- Keep the stick feel: FF x rate is what the pilot feels
             rateActions(a, name, a.F / newF, act)
@@ -144,7 +158,7 @@ local function advise(a, axis)
         response = "Matches the stick"
         local asked = maxRateAsked(a)
         if axis ~= 2 and asked and a.fullCount >= FULL_MIN_COUNT and a.fullSatCount >= FULL_SAT_SHARE * a.fullCount
-                and a.fullMaxRate < FULL_REACH * asked then
+                and a.fullMaxRate < FULL_REACH * asked and room(rateActionCount(a)) then
             rateActions(a, name, a.fullMaxRate / asked, act)
             why(string.format("Full stick asks %d deg/s but the heli tops out at %d.", asked, a.fullMaxRate))
         end
@@ -157,14 +171,16 @@ local function advise(a, axis)
         local rebound = round(a.meanRebound * 100)
         stops = string.format("%d%% bounce-back", rebound)
         if a.meanRebound >= REBOUND_BAD then
-            if a.meanIterm >= ITERM_PUSH and a.relaxCutoff > CUTOFF_MIN then
+            -- No room for the cutoff only after FF and two rate lines; FF is off then, so
+            -- the next branch says to fix FF first.
+            if a.meanIterm >= ITERM_PUSH and a.relaxCutoff > CUTOFF_MIN and room(1) then
                 act(string.format("PID Controller > Cutoff point %s: %d -> %d", axisLetters[axis], a.relaxCutoff,
                     clamp(round(a.relaxCutoff * CUTOFF_STEP), CUTOFF_MIN, a.relaxCutoff - 1)))
                 why("After a stop, the I-term pushes the heli back.")
             elseif ffOff(a) and a.F > 0 then
                 why(string.format("Stops bounce back %d%%. Fix FF first, then check again.", rebound))
-            else
-                act(string.format("PID Gains > %s > P: %d -> %d", name, a.P, clamp(round(a.P * P_STEP), a.P + 1, F_MAX)))
+            elseif room(1) then
+                act(string.format("PID Gains > %s > P: %d -> %d", name, a.P, clamp(round(a.P * P_STEP), a.P + 1, GAIN_MAX)))
                 why(string.format("Stops bounce back %d%%. More P brakes them (or add B).", rebound))
             end
         end
@@ -199,15 +215,22 @@ local function textWidth(s)
     return #s * charW
 end
 
+-- A word too wide for a line of its own is cut into pieces that fit
 local function wrap(text, maxW, out)
     local line = ""
     for word in string.gmatch(text, "%S+") do
         local candidate = (line == "") and word or (line .. " " .. word)
-        if line ~= "" and textWidth(candidate) > maxW then
-            out[#out + 1] = line
-            line = word
-        else
+        if textWidth(candidate) <= maxW then
             line = candidate
+        else
+            if line ~= "" then out[#out + 1] = line end
+            while #word > 1 and textWidth(word) > maxW do
+                local n = #word - 1
+                while n > 1 and textWidth(string.sub(word, 1, n)) > maxW do n = n - 1 end
+                out[#out + 1] = string.sub(word, 1, n)
+                word = string.sub(word, n + 1)
+            end
+            line = word
         end
     end
     if line ~= "" then out[#out + 1] = line end
@@ -284,7 +307,7 @@ page = {
     readOnly    = true,
 
     timer = function(self)
-        if rf2.mspQueue:isProcessed() and rf2.clock() - lastPoll >= POLL_INTERVAL then
+        if not unsupported and rf2.mspQueue:isProcessed() and rf2.clock() - lastPoll >= POLL_INTERVAL then
             requestAxis()
         end
     end,
@@ -305,6 +328,8 @@ page = {
         rf2.lcdNeedsInvalidate = true
     end,
 
+    -- The queue retries without limit, so an error here is the FC's MSP error reply:
+    -- firmware without the command. Say so once and stop polling; changing Axis asks again.
     onError = function(self)
         if unsupported then return end
         unsupported = true
@@ -318,7 +343,7 @@ page = {
         mspTuneAdvisor.clear(function()
             lastSignature = nil
             requestAxis()
-        end)
+        end, page, page.onError)
     end,
 }
 

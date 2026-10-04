@@ -67,12 +67,15 @@ local function getAxis(axis, callback, callbackParam, errorCallback)
     rf2.mspQueue:add(message)
 end
 
-local function clear(callback, callbackParam)
+local function clear(callback, callbackParam, errorCallback)
     local message = {
         command = 0x5F11,
         payload = {},
         processReply = function(self, buf)
             if callback then callback(callbackParam) end
+        end,
+        errorHandler = function(self)
+            if errorCallback then errorCallback(callbackParam) end
         end,
         simulatorResponse = {},
     }
